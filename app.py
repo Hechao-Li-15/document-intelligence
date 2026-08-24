@@ -102,7 +102,7 @@ if token_exists:
     st.success("Google Drive connected")
 else:
     st.info("Google Drive is not connected. Connect it to load your Drive folders.")
-if st.button("Connect Google Drive", type="primary"):
+if st.button("Connect Google Drive", type="primary", key="connect_google_drive_dashboard"):
     try:
         with st.spinner("Waiting for Google authentication..."):
             drive_service = get_drive_service()
@@ -135,7 +135,7 @@ if st.session_state.get("selected_folder_id"):
         sync_state = session.get(SyncState, folder_id)
     st.caption(f"Last successful sync: {format_datetime(sync_state.last_successful_sync if sync_state else None)}")
 
-    if st.button("Sync Google Drive"):
+    if st.button("Sync Google Drive", key="sync_google_drive_dashboard"):
         try:
             with st.spinner("Synchronizing supported files..."):
                 drive_service = get_drive_service()
@@ -213,87 +213,3 @@ if question:
         st.caption("Sources: " + ", ".join(sources))
     elif not records.empty:
         st.caption("No source records were selected for this answer.")
-"""Streamlit entry point for the Document Intelligence application."""
-
-import streamlit as st
-
-from document_intelligence.database import SessionLocal, init_db
-from document_intelligence.google_drive import (
-    GoogleDriveSetupError,
-    get_drive_service,
-    list_drive_folders,
-)
-from document_intelligence.sync import sync_folder
-
-
-init_db()
-
-
-st.set_page_config(
-    page_title="Document Intelligence",
-    page_icon="DOC",
-    layout="wide",
-)
-
-st.title("Document Intelligence")
-st.write("Connect Google Drive to choose the folder containing your financial documents.")
-
-st.header("Connect Google Drive")
-st.caption("Read-only access is used to list your Drive folders.")
-
-if st.button("Connect Google Drive", type="primary"):
-    try:
-        with st.spinner("Waiting for Google authentication..."):
-            drive_service = get_drive_service()
-            st.session_state.drive_folders = list_drive_folders(drive_service)
-        st.success("Google Drive connected.")
-    except GoogleDriveSetupError as error:
-        st.error(str(error))
-    except Exception as error:
-        st.error(f"Google Drive connection failed: {error}")
-
-folders = st.session_state.get("drive_folders", [])
-if folders:
-    folder_options = {folder["name"]: folder["id"] for folder in folders}
-    selected_folder = st.selectbox(
-        "Financial documents folder",
-        options=list(folder_options),
-    )
-    st.session_state.selected_folder_id = folder_options[selected_folder]
-elif "drive_folders" in st.session_state:
-    st.info("No folders were found in this Google Drive.")
-
-if st.session_state.get("selected_folder_id"):
-    st.header("Synchronize Documents")
-    if st.button("Sync Google Drive"):
-        try:
-            with st.spinner("Synchronizing supported files..."):
-                drive_service = get_drive_service()
-                with SessionLocal() as session:
-                    st.session_state.sync_summary = sync_folder(
-                        drive_service,
-                        session,
-                        st.session_state.selected_folder_id,
-                    )
-            st.success("Google Drive synchronization completed.")
-        except GoogleDriveSetupError as error:
-            st.error(str(error))
-        except Exception as error:
-            st.error(f"Google Drive synchronization failed: {error}")
-
-summary = st.session_state.get("sync_summary")
-if summary:
-    st.subheader("Sync Summary")
-    columns = st.columns(5)
-    for column, label, value in zip(
-        columns,
-        ("Total files", "New", "Updated", "Skipped", "Failed"),
-        (
-            summary.total_files,
-            summary.new_files,
-            summary.updated_files,
-            summary.skipped_files,
-            summary.failed_files,
-        ),
-    ):
-        column.metric(label, value)
