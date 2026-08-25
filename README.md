@@ -2,7 +2,7 @@
 
 Take-home project skeleton for a Streamlit application that connects to Google Drive, synchronizes supported financial-document metadata, and provides a foundation for document extraction and structured financial analysis.
 
-> **Current implementation:** Google OAuth, folder selection, incremental PDF/CSV/HTML file synchronization, SQLite metadata persistence, sync summaries, and document-status UI are implemented. PDF/CSV/HTML content extraction, LLM normalization, financial-record storage, and natural-language Q&A are planned but not implemented yet.
+> **Current implementation:** Google OAuth, folder selection, incremental PDF/CSV/HTML synchronization, PDF text extraction, typed local Ollama financial extraction, SQLite persistence, sync summaries, and document-status UI are implemented. Ask Your Documents uses the local model for grounded responses from extracted records.
 
 ## Features
 
@@ -12,10 +12,12 @@ Take-home project skeleton for a Streamlit application that connects to Google D
 - Synchronizes PDF, CSV, and HTML file metadata when the user clicks **Sync Google Drive**.
 - Detects new, unchanged, and modified files by Google Drive file ID and `modifiedTime`.
 - Stores file metadata and per-folder last successful sync time in SQLite through SQLAlchemy.
+- Downloads and processes PDF files with PyMuPDF and local Ollama structured output.
+- Stores normalized financial records linked to their source documents.
 - Displays sync counts and a document-status table in Streamlit.
 - Shows clear setup, connection, synchronization, and empty states.
 
-The application does not currently download or parse document contents, call OpenAI, store normalized financial records, or answer financial questions.
+CSV and HTML files are synchronized as metadata but are not yet processed for extraction. The application does not yet provide general-purpose natural-language Q&A.
 
 ## Architecture
 
@@ -40,8 +42,8 @@ flowchart LR
 - Google OAuth via `google-auth-oauthlib`
 - SQLite and SQLAlchemy for synchronized metadata
 - pandas for the current UI's tabular data boundary
-- PyMuPDF and BeautifulSoup listed as planned document-parsing dependencies
-- OpenAI listed as a planned structured-extraction dependency
+- PyMuPDF for PDF text extraction; BeautifulSoup is reserved for future HTML parsing
+- Ollama with llama3.2:3b for typed structured financial extraction and Q&A
 
 ## Project Structure
 
@@ -105,14 +107,13 @@ The app requests `https://www.googleapis.com/auth/drive.readonly`. The first con
 
 ## Environment Variables
 
-There are currently no required environment variables. `.env.example` documents placeholders for future OpenAI and Google configuration:
+The app uses local Ollama at `http://localhost:11434` with the `llama3.2:3b` model. Pull it before running the app:
 
-```text
-OPENAI_API_KEY=
-GOOGLE_CLIENT_SECRETS_FILE=credentials.json
+```powershell
+ollama pull llama3.2:3b
 ```
 
-The current implementation reads the fixed root-level `credentials.json` path and does not yet call OpenAI or load `.env` values. Do not place real keys in the repository.
+The current implementation reads the fixed root-level `credentials.json` path for Google Drive OAuth and does not require any external API key.
 
 ## Running the Application
 
@@ -135,7 +136,7 @@ Synchronization is manual and starts when the user clicks **Sync Google Drive**:
 5. A known file with a different `modifiedTime` has its metadata updated and is counted as **updated**.
 6. The sync stores the last successful sync time for the selected folder in `sync_state`.
 
-The current sync stores metadata only. It does not download, parse, or extract document contents.
+PDF files are downloaded and processed during synchronization. CSV and HTML files currently store metadata only.
 
 ## Design Decisions and Tradeoffs
 

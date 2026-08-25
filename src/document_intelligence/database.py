@@ -3,7 +3,7 @@
 from collections.abc import Generator
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -37,6 +37,12 @@ def get_session() -> Generator[Session, None, None]:
 def init_db() -> None:
     """Create all registered tables."""
     Base.metadata.create_all(bind=engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("drive_files")}
+    with engine.begin() as connection:
+        if "processing_status" not in columns:
+            connection.execute(text("ALTER TABLE drive_files ADD COLUMN processing_status VARCHAR(40) DEFAULT 'Pending extraction'"))
+        if "processing_error" not in columns:
+            connection.execute(text("ALTER TABLE drive_files ADD COLUMN processing_error VARCHAR(2000)"))
 
 
 def database_status() -> str:

@@ -1,18 +1,30 @@
 """Streamlit user interface for the Document Intelligence application."""
 
 from datetime import datetime
+import logging
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import pandas as pd
 import streamlit as st
 from sqlalchemy import inspect, text
+from document_intelligence.extraction import ask_ollama_question, check_ollama_available
 from document_intelligence.database import SessionLocal, engine, init_db
+from document_intelligence.question_answering import answer_question_from_records
 from document_intelligence.google_drive import (
     GoogleDriveSetupError,
     get_drive_service,
     list_drive_folders,
 )
 from document_intelligence.models import DriveFile, SyncState
-from document_intelligence.sync import sync_folder
+from document_intelligence.sync import process_pending_documents, sync_folder
 
+logging.basicConfig(level=logging.INFO)
 init_db()
 
 st.set_page_config(page_title="Document Intelligence", page_icon="DOC", layout="wide")
@@ -31,104 +43,99 @@ def load_financial_records() -> pd.DataFrame:
     return pd.DataFrame()
 
 def answer_question(question: str, records: pd.DataFrame) -> tuple[str, list[str]]:
-    """Answer only from records already loaded from SQLite."""
+    """Answer only from the extracted SQLite records, grounding the response in the database first."""
     if records.empty:
         return "No extracted financial records are available yet.", []
+    if not check_ollama_available():
+        return "Ollama is not running. Start the local service and run 'ollama pull llama3.2:3b'.", []
 
-    normalized_columns = {
-        column.lower().replace(" ", "_"): column for column in records.columns
-    }
-    return_column = next(
-        (
-            normalized_columns[name]
-            for name in ("return_percentage", "return", "return_pct")
-            if name in normalized_columns
-        ),
-        None,
-    )
-    fund_column = next(
-        (normalized_columns[name] for name in ("fund_name", "fund") if name in normalized_columns),
-        None,
-    )
-    source_column = next(
-        (
-            normalized_columns[name]
-            for name in ("source_filename", "source_file", "filename")
-            if name in normalized_columns
-        ),
-        None,
-    )
-    date_column = next(
-        (
-            normalized_columns[name]
-            for name in ("reporting_date", "reporting_period", "date")
-            if name in normalized_columns
-        ),
-        None,
-    )
+    payload = records.where(pd.notna(records), None).to_dict(orient="records")
+    answer, sources = answer_question_from_records(question, payload)
 
-    if return_column and any(word in question.lower() for word in ("best", "highest", "top")):
-        candidates = records.copy()
-        if date_column and "january" in question.lower():
-            dates = pd.to_datetime(candidates[date_column], errors="coerce")
-            candidates = candidates[dates.dt.month == 1]
-        returns = pd.to_numeric(
-            candidates[return_column].astype(str).str.rstrip("%"), errors="coerce"
-        )
-        candidates = candidates.loc[returns.notna()].copy()
-        if not candidates.empty:
-            winner_index = returns.loc[candidates.index].idxmax()
-            winner = candidates.loc[winner_index]
-            fund = f" for {winner[fund_column]}" if fund_column else ""
-            source = (
-                [str(winner[source_column])]
-                if source_column and pd.notna(winner[source_column])
-                else []
-            )
-            return f"The best return{fund} was {winner[return_column]}.", source
+    if not sources and answer and "I couldn't find a matching financial record" not in answer:
+        return answer, sorted({str(item.get("source_filename")) for item in payload if item.get("source_filename")})
 
-    return (
-        "I can answer questions from the available records, but this question "
-        "needs a supported financial query handler.",
-        [],
-    )
+    if "I couldn't find a matching financial record" in answer:
+        return answer, []
+
+    if sources:
+        return answer, sources
+
+    return ask_ollama_question(question, payload), sorted({str(item.get("source_filename")) for item in payload if item.get("source_filename")})
 
 st.title("Document Intelligence")
 st.caption("Google Drive documents, processing status, and grounded financial records")
 
-st.header("Google Drive Connection")
-token_exists = (st.session_state.get("drive_connected") or False)
-if token_exists:
-    st.success("Google Drive connected")
+if not check_ollama_available():
+    st.warning("Ollama is not running. Start it with 'ollama serve' and pull the model with 'ollama pull llama3.2:3b'.")
 else:
-    st.info("Google Drive is not connected. Connect it to load your Drive folders.")
+    st.success("Ollama is available at http://localhost:11434 using llama3.2:3b.")
+
+st.header("Google Drive Connection")
 if st.button("Connect Google Drive", type="primary", key="connect_google_drive_dashboard"):
     try:
         with st.spinner("Waiting for Google authentication..."):
             drive_service = get_drive_service()
-            st.session_state.drive_folders = list_drive_folders(drive_service)
+            folders = list_drive_folders(drive_service)
+            st.session_state.drive_folders = folders
             st.session_state.drive_connected = True
-        st.success("Google Drive connected.")
+    except GoogleDriveSetupError as error:
+        st.session_state.drive_connected = False
+        st.error(str(error))
+    except Exception as error:
+        st.session_state.drive_connected = False
+        st.error(f"Google Drive connection failed: {error}")
+
+if st.session_state.get("drive_connected"):
+    st.success("Google Drive connected")
+else:
+    st.info("Google Drive is not connected. Connect it to load your Drive folders.")
+
+# Re-fetch folders when Streamlit reruns without retaining the prior list.
+if st.session_state.get("drive_connected") and "drive_folders" not in st.session_state:
+    try:
+        with st.spinner("Loading Google Drive folders..."):
+            drive_service = get_drive_service()
+            folders = list_drive_folders(drive_service)
+            st.session_state.drive_folders = folders
     except GoogleDriveSetupError as error:
         st.error(str(error))
     except Exception as error:
-        st.error(f"Google Drive connection failed: {error}")
+        st.error(f"Could not load Google Drive folders: {error}")
 
 folders = st.session_state.get("drive_folders", [])
 if folders:
-    folder_options = {folder["name"]: folder["id"] for folder in folders}
+    folder_options = {}
+    for folder in folders:
+        label = folder["name"]
+        if label in folder_options:
+            label = f"{label} ({folder['id'][:8]})"
+        folder_options[label] = folder
+
+    saved_folder_id = st.session_state.get("selected_folder_id")
+    option_labels = list(folder_options)
+    selected_index = next(
+        (
+            index
+            for index, folder in enumerate(folder_options.values())
+            if folder["id"] == saved_folder_id
+        ),
+        0,
+    )
     selected_folder = st.selectbox(
         "Monitored folder",
-        options=list(folder_options),
-        index=(
-            list(folder_options.values()).index(st.session_state["selected_folder_id"])
-            if st.session_state.get("selected_folder_id") in folder_options.values()
-            else 0
-        ),
+        options=option_labels,
+        index=selected_index,
+        key="monitored_folder_selector",
     )
-    st.session_state.selected_folder_id = folder_options[selected_folder]
+    selected_folder_data = folder_options[selected_folder]
+    st.session_state.selected_folder_id = selected_folder_data["id"]
+    st.session_state.selected_folder_name = selected_folder_data["name"]
 else:
-    st.warning("No folder is selected. Connect Google Drive and choose a folder.")
+    if st.session_state.get("drive_connected"):
+        st.warning("No folders were found in this Google Drive.")
+    else:
+        st.warning("No folder is selected. Connect Google Drive and choose a folder.")
 if st.session_state.get("selected_folder_id"):
     folder_id = st.session_state.selected_folder_id
     with SessionLocal() as session:
@@ -141,6 +148,9 @@ if st.session_state.get("selected_folder_id"):
                 drive_service = get_drive_service()
                 with SessionLocal() as session:
                     st.session_state.sync_summary = sync_folder(
+                        drive_service, session, folder_id
+                    )
+                    st.session_state.sync_summary.failed_files += process_pending_documents(
                         drive_service, session, folder_id
                     )
             st.success("Google Drive synchronization completed.")
@@ -170,15 +180,22 @@ if not document_rows:
     st.info("No documents have been synchronized yet.")
 else:
     st.metric("Total documents", len(document_rows))
-    st.metric("Successfully processed", 0, help="Extraction is not available yet.")
-    st.metric("Failed", summary.failed_files if summary else 0)
+    st.metric(
+        "Successfully processed",
+        sum(document.processing_status == "Successfully processed" for document in document_rows),
+    )
+    st.metric(
+        "Failed",
+        sum(document.processing_status == "Failed" for document in document_rows),
+    )
     documents = pd.DataFrame(
         [
             {
                 "Filename": document.name,
                 "File type": document.mime_type,
-                "Processing status": "Pending extraction",
+                "Processing status": document.processing_status,
                 "Modified date": format_datetime(document.modified_time),
+                "Error": document.processing_error or "",
             }
             for document in document_rows
         ]
